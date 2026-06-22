@@ -1,72 +1,207 @@
-# Backend Ventas - Sistema de Gestión de Despachos y Ventas
+# Backend Ventas (rama `deploy`)
 
-##  Descripción del Proyecto
+README adaptado al estado real de la rama `deploy`.
 
-Este proyecto es el **Módulo de Ventas** del Sistema de Gestión de Despachos y Ventas. Es un microservicio encargado de la gestión de productos, pedidos y transacciones comerciales. 
-Este backend funciona de manera desacoplada y se comunica con un Frontend en React y otro microservicio de Despachos, a través de un reverse proxy (Nginx).
+## 1) Arquitectura backend (Java/Spring Boot)
 
-El sistema está diseñado con propósitos **académicos y educativos** para demostrar buenas prácticas en el desarrollo de aplicaciones modernas con arquitectura de microservicios, bases de datos en la nube (AWS RDS) y despliegues mediante pipelines CI/CD.
+Aplicación Spring Boot 3.4.x con Java 17 y arquitectura en capas:
 
----
+- **Controller**: `src/main/java/com/citt/controller/VentaController.java`
+  - Expone la API REST bajo `/api/v1/ventas`.
+- **Service**:
+  - Interfaz: `src/main/java/com/citt/persistence/services/VentaService.java`
+  - Implementación: `src/main/java/com/citt/persistence/services/VentaServiceImpl.java`
+- **Repository**: `src/main/java/com/citt/persistence/repository/VentaRepository.java` (Spring Data JPA).
+- **Entidad JPA**: `src/main/java/com/citt/persistence/entity/Venta.java`.
+- **Manejo de errores**:
+  - Excepción de dominio: `VentaNotFoundException`
+  - Handler global: `RestResponseEntityExceptionHandler` (retorna 404 con body estructurado).
+- **OpenAPI/Swagger**:
+  - Configuración: `src/main/java/com/citt/config/OpenApiConfing.java`
+  - UI en `/swagger-ui.html`.
 
-##  Tecnologías Utilizadas
+Dependencias clave (`pom.xml`):
+- `spring-boot-starter-web`
+- `spring-boot-starter-data-jpa`
+- `mysql-connector-j` (runtime)
+- `springdoc-openapi-starter-webmvc-ui`
+- `spring-boot-starter-validation`
+- `h2` (tests)
 
-- **Spring Boot 3** - Framework principal para la creación del microservicio en Java.
-- **Spring Data JPA & Hibernate** - ORM para la interacción con la base de datos.
-- **MySQL** - Base de datos relacional (alojada en AWS RDS).
-- **Swagger / OpenAPI 3** - Para la documentación interactiva de la API.
-- **Docker** - Containerización de la aplicación.
-- **GitHub Actions** - Pipeline CI/CD para automatizar builds y despliegues en AWS ECR y EC2.
-- **Maven** - Herramienta de gestión de dependencias y build.
+## 2) Configuración de MySQL vía variables de entorno
 
----
+La app toma configuración desde `src/main/resources/application.properties`:
 
-##  Configuración y Puerto
+- `spring.datasource.url=jdbc:mysql://${DB_ENDPOINT}:${DB_PORT}/${DB_NAME}...`
+- `spring.datasource.username=${DB_USERNAME}`
+- `spring.datasource.******
+- `spring.jpa.hibernate.ddl-auto=update`
+- `server.port=8080`
 
-El servicio está configurado para ejecutarse localmente y en el contenedor en el puerto **8080**.
-La conexión a la base de datos se realiza a través de variables de entorno para garantizar la seguridad de las credenciales (AWS RDS).
+Variables requeridas en runtime:
 
-### Variables de Entorno Requeridas:
-- `DB_ENDPOINT`: Endpoint de la base de datos MySQL en AWS RDS.
-- `DB_PORT`: Puerto de la base de datos (por defecto 3306).
-- `DB_NAME`: Nombre de la base de datos.
-- `DB_USERNAME`: Usuario de la base de datos.
-- `DB_PASSWORD`: Contraseña de la base de datos.
+| Variable | Uso |
+|---|---|
+| `DB_ENDPOINT` | Host del servidor MySQL |
+| `DB_PORT` | Puerto MySQL (normalmente `3306`) |
+| `DB_NAME` | Nombre de base de datos |
+| `DB_USERNAME` | Usuario |
+| `DB_PASSWORD` | Contraseña |
 
----
+### En Kubernetes (rama `deploy`)
 
-##  Endpoints Principales
+En `k8s/deployment.yaml`, estas variables se inyectan así:
 
-La API RESTful está expuesta bajo el prefijo `/api/v1/ventas`.
+- `DB_ENDPOINT=ventas-mysql-service` (Service interno de MySQL)
+- `DB_PORT=3306`
+- `DB_NAME`, `DB_USERNAME`, `DB_PASSWORD` desde el Secret `ventas-db-secret`.
+
+El Secret se crea/actualiza en CI desde GitHub Secrets.
+
+## 3) Flujo exacto de CI/CD en `deploy` (GitHub Actions + ECR + EKS)
+
+Workflow: `.github/workflows/main.yml`  
+Trigger:
+- `push` a rama `deploy`
+- `workflow_dispatch` manual
+
+### Job 1: `build-and-push`
+
+1. Checkout.
+2. Configura credenciales AWS (`aws-actions/configure-aws-credentials@v4`).
+3. Login a ECR (`aws-actions/amazon-ecr-login@v2`).
+4. Define `image_tag` = `${{ github.sha }}`.
+5. Build Docker con 2 tags:
+   - `${REGISTRY_URL}/${AWS_ECR_REPOSITORY}:${github.sha}`
+   - `${REGISTRY_URL}/${AWS_ECR_REPOSITORY}:latest`
+6. Push de ambos tags a ECR.
+
+### Job 2: `deploy-to-eks` (depende del Job 1)
+
+1. Checkout.
+2. Configura credenciales AWS.
+3. Instala `kubectl` (`v1.29.0`).
+4. Ejecuta `aws eks update-kubeconfig` con `EKS_CLUSTER_NAME`.
+5. Crea/aplica Secret `ventas-db-secret` en namespace objetivo (`EKS_NAMESPACE`) con:
+   - `MYSQL_DATABASE` ← `DB_NAME`
+   - `MYSQL_ROOT_PASSWORD` ← `DB_PASSWORD`
+   - `MYSQL_USER` ← `DB_USER`
+   - `MYSQL_PASSWORD` ← `DB_PASSWORD`
+6. Aplica manifiestos `k8s/`:
+   - `k8s/deployment.yaml`
+   - `k8s/service.yaml`
+   - `k8s/mysql-deployment.yaml`
+   - `k8s/mysql-service.yaml`
+7. Actualiza imagen del deployment (`kubectl set image`) usando:
+   - `K8S_DEPLOYMENT_NAME`
+   - `K8S_CONTAINER_NAME`
+   - imagen ECR con `IMAGE_TAG` (SHA)
+8. Verifica rollout y lista pods/services.
+
+### Secrets usados por el workflow
+
+- `AWS_ACCOUNT_ID`
+- `AWS_REGION`
+- `AWS_ACCESS_KEY_ID`
+- `AWS_SECRET_ACCESS_KEY`
+- `AWS_SESSION_TOKEN`
+- `AWS_ECR_REPOSITORY`
+- `EKS_CLUSTER_NAME`
+- `EKS_NAMESPACE`
+- `K8S_DEPLOYMENT_NAME`
+- `K8S_CONTAINER_NAME`
+- `DB_NAME`
+- `DB_USER`
+- `DB_PASSWORD`
+
+## 4) Endpoints y documentación expuesta
+
+Base path: `/api/v1/ventas`
 
 | Método | Endpoint | Descripción |
-| :--- | :--- | :--- |
-| `GET` | `/api/v1/ventas` | Obtener todas las ventas registradas. |
-| `GET` | `/api/v1/ventas/{idVenta}` | Obtener una venta específica por su ID. |
-| `POST` | `/api/v1/ventas` | Crear un nuevo registro de venta. |
-| `PUT` | `/api/v1/ventas/{idVenta}` | Actualizar la información de una venta existente. |
-| `DELETE` | `/api/v1/ventas/{idVenta}` | Eliminar una venta por su ID. |
+|---|---|---|
+| GET | `/api/v1/ventas` | Listar ventas |
+| GET | `/api/v1/ventas/{idVenta}` | Obtener venta por ID |
+| POST | `/api/v1/ventas` | Crear venta |
+| PUT | `/api/v1/ventas/{idVenta}` | Actualizar venta |
+| DELETE | `/api/v1/ventas/{idVenta}` | Eliminar venta |
 
-### Documentación de la API (Swagger)
-Puedes probar e interactuar con la API directamente a través de Swagger UI cuando el servidor esté corriendo:
-- **URL local:** `http://localhost:8080/swagger-ui.html`
+Swagger/OpenAPI:
+- UI: `http://localhost:8080/swagger-ui.html`
 
----
+## 5) Guía práctica: clonar, configurar, ejecutar local y desplegar en EKS
 
-##  Despliegue CI/CD
+## Clonar repositorio
 
-Al igual que el Frontend y el microservicio de Despachos, este servicio cuenta con un flujo CI/CD configurado con **GitHub Actions**.
+```bash
+git clone https://github.com/RenatoHinojosa/evaluaciondvops3-ventas.git
+cd evaluaciondvops3-ventas
+```
 
-### **Flujo del Pipeline:**
-1. **Build & Push:** Construye el proyecto con Maven, empaqueta el `.jar` en una imagen Docker y la sube a **AWS ECR**.
-2. **Deploy to EC2:** Se conecta a la instancia EC2 usando **AWS Systems Manager (SSM)**, descarga la nueva imagen desde ECR, detiene el contenedor antiguo y levanta el nuevo contenedor de ventas mapeando el puerto 8080.
+## Ejecutar local (Maven)
 
----
+Definir variables:
 
-##  Arquitectura del Sistema
+```bash
+export DB_ENDPOINT=localhost
+export DB_PORT=3306
+export DB_NAME=ventas
+export DB_USERNAME=root
+export DB_PASSWORD=tu_password
+```
 
-Este microservicio forma parte de una arquitectura mayor enrutada por **Nginx**:
-- **Frontend (React)**: Interfaz de usuario servida en el puerto 80.
-- **Backend Ventas (Este proyecto)**: API en el puerto 8080 (`/api/v1/ventas/*`).
-- **Backend Despachos**: API en el puerto 8081 (`/api/v1/despachos/*`).
-- Todas las peticiones del cliente son manejadas por el Proxy Inverso (Nginx).
+Luego:
+
+```bash
+mvn spring-boot:run
+```
+
+## Ejecutar en Docker local
+
+```bash
+docker build -t ventas-backend:local .
+docker run --rm -p 8080:8080 \
+  -e DB_ENDPOINT=host.docker.internal \
+  -e DB_PORT=3306 \
+  -e DB_NAME=ventas \
+  -e DB_USERNAME=root \
+  -e DB_PASSWORD=tu_password \
+  ventas-backend:local
+```
+
+## Desplegar en EKS (flujo recomendado de la rama)
+
+1. Configurar todos los GitHub Secrets del workflow.
+2. Confirmar que el clúster EKS y el namespace existen.
+3. Hacer push a la rama `deploy`.
+4. Validar en Actions que:
+   - la imagen se publicó en ECR,
+   - el rollout del deployment `ventas` fue exitoso.
+
+## Manifiestos Kubernetes (estado actual)
+
+- `k8s/deployment.yaml`: Deployment de backend (`ventas`).
+- `k8s/service.yaml`: Service `ClusterIP` (`ventas-service`).
+- `k8s/mysql-deployment.yaml`: MySQL 8.0 en el clúster.
+- `k8s/mysql-service.yaml`: Service interno `ventas-mysql-service`.
+
+### Nota importante de persistencia
+
+`k8s/mysql-deployment.yaml` usa `emptyDir`, por lo que **los datos de MySQL son efímeros** (se pierden si el pod se recrea).  
+Para producción, reemplazar por un `PersistentVolumeClaim`.
+
+## Dockerfile (build de la app)
+
+`Dockerfile` multi-stage:
+
+1. **Build stage**: `maven:3.9.6-eclipse-temurin-17`
+   - `mvn clean package -DskipTests`
+2. **Runtime stage**: `eclipse-temurin:17-jre-jammy`
+   - Copia `target/*.jar` a `/app/app.jar`
+   - Expone `8080`
+   - `ENTRYPOINT ["java", "-jar", "app.jar"]`
+
+## Observación de pruebas
+
+El `contextLoads` puede fallar en entornos sin variables `DB_*` porque el perfil por defecto apunta a MySQL (`application.properties`).  
+Existe configuración de test con H2 en `application-test.properties`, útil cuando se ejecutan pruebas con ese perfil.
